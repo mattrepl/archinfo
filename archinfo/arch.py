@@ -1,7 +1,11 @@
+import logging
 import struct as _struct
 import platform as _platform
 import re
 from archinfo.archerror import ArchError
+
+l = logging.getLogger("archinfo.arch")
+l.addHandler(logging.NullHandler())
 
 try:
     import pyvex as _pyvex
@@ -18,20 +22,23 @@ try:
 except ImportError:
     _capstone = None
 
-import logging
-l = logging.getLogger('archinfo.arch')
-l.addHandler(logging.NullHandler())
+try:
+    import keystone as _keystone
+except ImportError:
+    _keystone = None
 
-class Endness:
+
+class Endness: # pylint: disable=no-init
     """ Endness specifies the byte order for integer values
 
     :cvar LE:      little endian, least significant byte is stored at lowest address
-    :cvar BE:      big endian, most significant byte is stored at lowest address 
+    :cvar BE:      big endian, most significant byte is stored at lowest address
     :cvar ME:      Middle-endian. Yep.
     """
     LE = "Iend_LE"
     BE = "Iend_BE"
     ME = 'Iend_ME'
+
 
 class Arch(object):
     """
@@ -62,13 +69,19 @@ class Arch(object):
     :ivar int stack_change: The change to the stack pointer caused by a push instruction
     :ivar str memory_endness: The endness of memory, as a VEX enum
     :ivar str register_endness: The endness of registers, as a VEX enum. Should usually be same as above
+    :ivar str instruction_endness: The endness of instructions stored in memory.
+        In other words, this controls whether instructions are stored endian-flipped compared to their description
+        in the ISA manual, and should be flipped when lifted. Iend_BE means "don't flip"
+        NOTE: Only used for non-libVEX lifters.
     :ivar dict sizeof: A mapping from C type to variable size in bits
-    :ivar cs_arch: The capstone arch value for this arch
-    :ivar cs_mode: The capstone mode value for this arch
-    :ivar uc_arch: The unicorn engine arch value for this arch
-    :ivar uc_mode: The unicorn engine mode value for this arch
-    :ivar uc_const: The unicorn engine constants module for this arch
-    :ivar uc_prefix: The prefix used for variables in the unicorn engine constants module
+    :ivar cs_arch: The Capstone arch value for this arch
+    :ivar cs_mode: The Capstone mode value for this arch
+    :ivar ks_arch: The Keystone arch value for this arch
+    :ivar ks_mode: The Keystone mode value for this arch
+    :ivar uc_arch: The Unicorn engine arch value for this arch
+    :ivar uc_mode: The Unicorn engine mode value for this arch
+    :ivar uc_const: The Unicorn engine constants module for this arch
+    :ivar uc_prefix: The prefix used for variables in the Unicorn engine constants module
     :ivar list function_prologs: A list of regular expressions matching the bytes for common function prologues
     :ivar list function_epilogs: A list of regular expressions matching the bytes for common function epilogues
     :ivar str ret_instruction: The bytes for a return instruction
@@ -89,13 +102,22 @@ class Arch(object):
     :ivar TLSArchInfo elf_tls: A description of how thread-local storage works
     """
     byte_width = 8
+    instruction_endness = "Iend_BE"
 
-    def __init__(self, endness):
+    def __init__(self, endness, instruction_endness=None):
+
         if endness not in (Endness.LE, Endness.BE, Endness.ME):
-            raise ArchError('Must pass a valid VEX endness: Endness.LE or Endness.BE')
+            raise ArchError('Must pass a valid endness: Endness.LE, Endness.BE, or Endness.ME')
 
-        if _pyvex:
-            self.vex_archinfo = _pyvex.default_vex_archinfo()
+        if instruction_endness is not None:
+            self.instruction_endness = instruction_endness
+
+        if self.vex_support:
+            if _pyvex:
+                self.vex_archinfo = _pyvex.default_vex_archinfo()
+        else:
+            self._vex_archinfo = None
+
         if endness == Endness.BE:
             if self.vex_archinfo:
                 self.vex_archinfo['endness'] = _pyvex.vex_endness_from_string('VexEndnessBE')
@@ -104,10 +126,13 @@ class Arch(object):
             if _capstone and self.cs_mode is not None:
                 self.cs_mode -= _capstone.CS_MODE_LITTLE_ENDIAN
                 self.cs_mode += _capstone.CS_MODE_BIG_ENDIAN
+            if _keystone and self.ks_mode is not None:
+                self.ks_mode -= _keystone.KS_MODE_LITTLE_ENDIAN
+                self.ks_mode += _keystone.KS_MODE_BIG_ENDIAN
             self.ret_instruction = reverse_ends(self.ret_instruction)
             self.nop_instruction = reverse_ends(self.nop_instruction)
 
-        # generate regitster mapping (offset, size): name
+        # generate register mapping (offset, size): name
         self.register_size_names = {}
         for k in self.registers:
             v = self.registers[k]
@@ -120,13 +145,13 @@ class Arch(object):
                 continue
             self.register_size_names[v] = k
 
-        # unicorn specific stuff
+        # Unicorn specific stuff
         if self.uc_mode is not None:
             if endness == Endness.BE:
                 self.uc_mode -= _unicorn.UC_MODE_LITTLE_ENDIAN
                 self.uc_mode += _unicorn.UC_MODE_BIG_ENDIAN
             self.uc_regs = { }
-            # map register names to unicorn const
+            # map register names to Unicorn const
             for r in self.register_names.values():
                 reg_name = self.uc_prefix + 'REG_' + r.upper()
                 if hasattr(self.uc_const, reg_name):
@@ -138,7 +163,7 @@ class Arch(object):
         Produce a copy of this instance of this arch.
         """
         new_arch = type(self)(self.memory_endness)
-        new_arch.vex_archinfo = self.vex_archinfo.copy()
+        new_arch.vex_archinfo = self.vex_archinfo.copy() if self.vex_archinfo is not None else None
 
         return new_arch
 
@@ -157,6 +182,7 @@ class Arch(object):
 
     def __getstate__(self):
         self._cs = None
+        self._ks = None
         return self.__dict__
 
     def __setstate__(self, data):
@@ -233,10 +259,13 @@ class Arch(object):
     @property
     def capstone(self):
         """
-        A capstone instance for this arch
+        A Capstone instance for this arch
         """
+        if _capstone is None:
+            l.warning("Capstone is not found!")
+            return None
         if self.cs_arch is None:
-            raise ArchError("Arch %s does not support disassembly with capstone" % self.name)
+            raise ArchError("Arch %s does not support disassembly with Capstone" % self.name)
         if self._cs is None:
             self._cs = _capstone.Cs(self.cs_arch, self.cs_mode)
             self._cs.detail = True
@@ -245,12 +274,42 @@ class Arch(object):
     @property
     def unicorn(self):
         """
-        A unicorn engine instance for this arch
+        A Unicorn engine instance for this arch
         """
         if _unicorn is None or self.uc_arch is None:
-            raise ArchError("Arch %s does not support with unicorn" % self.name)
-        # always create a new unicorn instance
+            raise ArchError("Arch %s does not support with Unicorn" % self.name)
+        # always create a new Unicorn instance
         return _unicorn.Uc(self.uc_arch, self.uc_mode)
+
+    def asm(self, string, addr=0, as_bytes=True, thumb=False):
+        """
+        Compile the assembly instruction represented by string using Keystone
+
+        :param string:      The textual assembly instructions, separated by semicolons
+        :param addr:        The address at which the text should be assembled, to deal with PC-relative access. Default 0
+        :param as_bytes:    Set to False to return a list of integers instead of a python byte string
+        :param thumb:       If working with an ARM processor, set to True to assemble in thumb mode.
+        :return:            The assembled bytecode
+        """
+        if thumb is True:
+            l.warning("Specified thumb=True on non-ARM architecture")
+        if _keystone is None:
+            l.warning("Keystone is not found!")
+            return None
+        if self.ks_arch is None:
+            raise ArchError("Arch %s does not support assembly with Keystone" % self.name)
+        if self._ks is None:
+            self._ks = _keystone.Ks(self.ks_arch, self.ks_mode)
+        try:
+            encoding, _ = self._ks.asm(string, addr, as_bytes) # pylint: disable=too-many-function-args
+        except TypeError:
+            bytelist, _ = self._ks.asm(string, addr)
+            if as_bytes:
+                encoding = ''.join(chr(c) for c in bytelist)
+            else:
+                encoding = bytelist
+
+        return encoding
 
     def translate_dynamic_tag(self, tag):
         try:
@@ -305,6 +364,53 @@ class Arch(object):
             path = sum([[x + 'tls/${ARCH}/', x + 'tls/', x + '${ARCH}/', x] for x in path], [])
         return map(subfunc, path)
 
+    @property
+    def vex_support(self):
+        """
+        Whether the architecture is supported by VEX or not.
+
+        :return: True if this Arch is supported by VEX, False otherwise.
+        :rtype:  bool
+        """
+
+        return self.vex_arch is not None
+
+    @property
+    def unicorn_support(self):
+        """
+        Whether the architecture is supported by Unicorn engine or not,
+
+        :return: True if this Arch is supported by the Unicorn engine, False otherwise.
+        :rtype:  bool
+        """
+
+        return self.qemu_name is not None
+
+    @property
+    def capstone_support(self):
+        """
+        Whether the architecture is supported by the Capstone engine or not.
+
+        :return: True if this Arch is supported by the Capstone engine, False otherwise.
+        :rtype:  bool
+        """
+
+        return self.cs_arch is not None
+
+    @property
+    def keystone_support(self):
+        """
+        Whether the architecture is supported by the Keystone engine or not.
+
+        :return: True if this Arch is supported by the Keystone engine, False otherwise.
+        :rtype:  bool
+        """
+
+        return self.ks_arch is not None
+
+    address_types = (int, long)
+    function_address_types = (int, long)
+
     # various names
     name = None
     vex_arch = None
@@ -347,6 +453,11 @@ class Arch(object):
     cs_arch = None
     cs_mode = None
     _cs = None
+
+    # Keystone stuff
+    ks_arch = None
+    ks_mode = None
+    _ks = None
 
     # Unicorn stuff
     uc_arch = None
@@ -392,6 +503,7 @@ arch_id_map = []
 
 all_arches = []
 
+
 def register_arch(regexes, bits, endness, my_arch):
     """
     Register a new architecture.
@@ -403,9 +515,10 @@ def register_arch(regexes, bits, endness, my_arch):
     :type regexes: list
     :param bits: The canonical "bits" of this architecture, ex. 32 or 64
     :type bits: int
-    :param endness: The "endness" of this architecture.  Use Endness.LE, Endness.BE, or "any"
-    :type endness: str
-    :param Arch my_arch:
+    :param endness: The "endness" of this architecture.  Use Endness.LE, Endness.BE, Endness.ME, "any", or None if the
+                    architecture has no intrinsic endianness.
+    :type endness: str or None
+    :param class my_arch:
     :return: None
     """
     if not isinstance(regexes, list):
@@ -421,8 +534,8 @@ def register_arch(regexes, bits, endness, my_arch):
     #    raise TypeError("Arch must be a subclass of archinfo.Arch")
     if not isinstance(bits, int):
         raise TypeError("Bits must be an int")
-    if not isinstance(endness,str):
-        if endness != Endness.BE and endness != Endness.LE and endness != "any":
+    if endness is not None:
+        if endness != Endness.BE and endness != Endness.LE and endness != Endness.ME and endness != "any":
             raise TypeError("Endness must be Endness.BE, Endness.LE, or 'any'")
     arch_id_map.append((regexes, bits, endness, my_arch))
     if endness == 'any':

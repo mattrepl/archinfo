@@ -1,7 +1,16 @@
+import logging
+
+l = logging.getLogger("archinfo.arch_amd64")
+
 try:
     import capstone as _capstone
 except ImportError:
     _capstone = None
+
+try:
+    import keystone as _keystone
+except ImportError:
+    _keystone = None
 
 try:
     import unicorn as _unicorn
@@ -20,38 +29,109 @@ class ArchAMD64(Arch):
 
     @property
     def capstone(self):
+        if _capstone is None:
+            l.warning("Capstone is not found!")
+            return None
         if self.cs_arch is None:
-            raise ArchError("Arch %s does not support disassembly with capstone" % self.name)
+            raise ArchError("Arch %s does not support disassembly with Capstone" % self.name)
         if self._cs is None:
             self._cs = _capstone.Cs(self.cs_arch, self.cs_mode)
-            self._cs.syntax = _capstone.CS_OPT_SYNTAX_ATT if self._x86_syntax == 'at&t' else _capstone.CS_OPT_SYNTAX_INTEL
+            self._cs.syntax = _capstone.CS_OPT_SYNTAX_ATT if self._cs_x86_syntax == 'at&t' else _capstone.CS_OPT_SYNTAX_INTEL
             self._cs.detail = True
         return self._cs
 
     @property
     def capstone_x86_syntax(self):
         """
-        Get the current syntax capstone uses for x86. It can be 'intel' or 'at&t'
+        Get the current syntax Capstone uses for x86. It can be 'intel' or 'at&t'
 
         :return: Capstone's current x86 syntax
         :rtype: str
         """
 
-        return self._x86_syntax
+        return self._cs_x86_syntax
 
     @capstone_x86_syntax.setter
     def capstone_x86_syntax(self, new_syntax):
         """
-        Set the syntax that capstone outputs for x86.
+        Set the syntax that Capstone outputs for x86.
         """
 
         if new_syntax not in ('intel', 'at&t'):
             raise ArchError('Unsupported Capstone x86 syntax. It must be either "intel" or "at&t".')
 
-        if new_syntax != self._x86_syntax:
-            # clear the existing capstone instance
+        if new_syntax != self._cs_x86_syntax:
+            # clear the existing Capstone instance
             self._cs = None
-            self._x86_syntax = new_syntax
+            self._cs_x86_syntax = new_syntax
+
+    @property
+    def keystone_x86_syntax(self):
+        """
+        Get the current syntax Keystone uses for x86. It can be 'intel',
+        'at&t', 'nasm', 'masm', 'gas' or 'radix16'
+
+        :return: Keystone's current x86 syntax
+        :rtype: str
+        """
+
+        return self._ks_x86_syntax
+
+    @keystone_x86_syntax.setter
+    def keystone_x86_syntax(self, new_syntax):
+        """
+        Set the syntax that Keystone uses for x86.
+        """
+
+        if new_syntax not in ('intel', 'at&t', 'nasm', 'masm', 'gas', 'radix16'):
+            e_str = 'Unsupported Keystone x86 syntax. It must be one of the following: '
+            e_str += '"intel", "at&t", "nasm", "masm", "gas" or "radix16".'
+            raise ArchError(e_str)
+
+        if new_syntax != self._ks_x86_syntax:
+            # clear the existing keystone instance
+            self._ks = None
+            self._ks_x86_syntax = new_syntax
+
+    def asm(self, string, addr=0, as_bytes=True, thumb=False):
+        """
+        Compile the assembly instruction represented by string using Keystone
+
+        :param string:      The textual assembly instructions, separated by semicolons
+        :param addr:        The address at which the text should be assembled, to deal with PC-relative access. Default 0
+        :param as_bytes:    Set to False to return a list of integers instead of a python byte string
+        :param thumb:       If working with an ARM processor, set to True to assemble in thumb mode.
+        :return:            The assembled bytecode
+        """
+        if thumb is True:
+            l.warning("Specified thumb=True on non-ARM architecture")
+        if _keystone is None:
+            l.warning("Keystone is not found!")
+            return None
+        if self.ks_arch is None:
+            raise ArchError("Arch %s does not support assembly with Keystone" % self.name)
+        if self._ks is None:
+            self._ks = _keystone.Ks(self.ks_arch, self.ks_mode)
+            self._ks.syntax = _keystone.KS_OPT_SYNTAX_INTEL
+            if self._ks_x86_syntax == 'at&t':
+                self._ks.syntax = _keystone.KS_OPT_SYNTAX_ATT
+            elif self._ks_x86_syntax == 'nasm':
+                self._ks.syntax = _keystone.KS_OPT_SYNTAX_NASM
+            elif self._ks_x86_syntax == 'masm':
+                self._ks.syntax = _keystone.KS_OPT_SYNTAX_MASM
+            elif self._ks_x86_syntax == 'gas':
+                self._ks.syntax = _keystone.KS_OPT_SYNTAX_GAS
+            elif self._ks_x86_syntax == 'radix16':
+                self._ks.syntax = _keystone.KS_OPT_SYNTAX_RADIX16
+        try:
+            encoding, _ = self._ks.asm(string, addr, as_bytes) # pylint: disable=too-many-function-args
+        except TypeError:
+            bytelist, _ = self._ks.asm(string, addr)
+            if as_bytes:
+                encoding = ''.join(chr(c) for c in bytelist)
+            else:
+                encoding = bytelist
+        return encoding
 
     bits = 64
     vex_arch = "VexArchAMD64"
@@ -78,7 +158,11 @@ class ArchAMD64(Arch):
     if _capstone:
         cs_arch = _capstone.CS_ARCH_X86
         cs_mode = _capstone.CS_MODE_64 + _capstone.CS_MODE_LITTLE_ENDIAN
-    _x86_syntax = None # Set it to 'att' in order to use AT&T syntax for x86
+    _cs_x86_syntax = None # Set it to 'att' in order to use AT&T syntax for x86
+    if _keystone:
+        ks_arch = _keystone.KS_ARCH_X86
+        ks_mode = _keystone.KS_MODE_64 + _keystone.KS_MODE_LITTLE_ENDIAN
+    _ks_x86_syntax = None
     uc_arch = _unicorn.UC_ARCH_X86 if _unicorn else None
     uc_mode = (_unicorn.UC_MODE_64 + _unicorn.UC_MODE_LITTLE_ENDIAN) if _unicorn else None
     uc_const = _unicorn.x86_const if _unicorn else None

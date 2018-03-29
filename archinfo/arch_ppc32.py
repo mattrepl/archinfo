@@ -1,12 +1,21 @@
+import logging
+
+l = logging.getLogger("archinfo.arch_ppc32")
+
 try:
     import capstone as _capstone
 except ImportError:
     _capstone = None
 
+try:
+    import keystone as _keystone
+except ImportError:
+    _keystone = None
+
 #try:
-#   import unicorn as _unicorn
+#    import unicorn as _unicorn
 #except ImportError:
-#   _unicorn = None
+#    _unicorn = None
 
 from .arch import Arch, register_arch, Endness
 from .tls import TLSArchInfo
@@ -50,7 +59,10 @@ class ArchPPC32(Arch):
     if _capstone:
         cs_arch = _capstone.CS_ARCH_PPC
         cs_mode = _capstone.CS_MODE_32 + _capstone.CS_MODE_LITTLE_ENDIAN
-    # unicorn not supported
+    if _keystone:
+        ks_arch = _keystone.KS_ARCH_PPC
+        ks_mode = _keystone.KS_MODE_32 + _keystone.KS_MODE_LITTLE_ENDIAN
+    # Unicorn not supported
     #uc_arch = _unicorn.UC_ARCH_PPC if _unicorn else None
     #uc_mode = (_unicorn.UC_MODE_32 + _unicorn.UC_MODE_LITTLE_ENDIAN) if _unicorn else None
     ret_instruction = b"\x20\x00\x80\x4e"
@@ -491,4 +503,5 @@ class ArchPPC32(Arch):
     ld_linux_name = 'ld.so.1'
     elf_tls = TLSArchInfo(1, 52, [], [48], [], 0x7000, 0x8000)
 
+register_arch([r'.*p\w*pc.*be'], 32, 'Iend_BE', ArchPPC32)
 register_arch([r'.*p\w*pc.*'], 32, 'any', ArchPPC32)
