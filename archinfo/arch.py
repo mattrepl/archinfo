@@ -1,7 +1,10 @@
+from past.builtins import long
+from future.utils import iteritems
 import logging
 import struct as _struct
 import platform as _platform
 import re
+import sys
 from archinfo.archerror import ArchError
 
 l = logging.getLogger("archinfo.arch")
@@ -26,6 +29,11 @@ try:
     import keystone as _keystone
 except ImportError:
     _keystone = None
+
+if sys.version_info[0] >= 3:
+    integer_types = int,
+else:
+    integer_types = (int, long)
 
 
 class Endness: # pylint: disable=no-init
@@ -206,7 +214,7 @@ class Arch(object):
     def get_default_reg_value(self, register):
         if register == 'sp':
             # Convert it to the corresponding register name
-            registers = [r for r, v in self.registers.items() if v[0] == self.sp_offset]
+            registers = [r for r, v in iteritems(self.registers) if v[0] == self.sp_offset]
             if len(registers) > 0:
                 register = registers[0]
             else:
@@ -306,6 +314,9 @@ class Arch(object):
             bytelist, _ = self._ks.asm(string, addr)
             if as_bytes:
                 encoding = ''.join(chr(c) for c in bytelist)
+                if not isinstance(encoding, bytes):
+                    l.warning("Cheap hack to create bytestring from Keystone!")
+                    encoding = encoding.encode()
             else:
                 encoding = bytelist
 
@@ -315,7 +326,7 @@ class Arch(object):
         try:
             return self.dynamic_tag_translation[tag]
         except KeyError:
-            if isinstance(tag, (int, long)):
+            if isinstance(tag, integer_types):
                 l.error("Please look up and add dynamic tag type %#x for %s", tag, self.name)
             return tag
 
@@ -323,7 +334,7 @@ class Arch(object):
         try:
             return self.symbol_type_translation[tag]
         except KeyError:
-            if isinstance(tag, (int, long)):
+            if isinstance(tag, integer_types):
                 l.error("Please look up and add symbol type %#x for %s", tag, self.name)
             return tag
 
@@ -362,7 +373,7 @@ class Arch(object):
 
         if pedantic:
             path = sum([[x + 'tls/${ARCH}/', x + 'tls/', x + '${ARCH}/', x] for x in path], [])
-        return map(subfunc, path)
+        return list(map(subfunc, path))
 
     @property
     def vex_support(self):
@@ -408,8 +419,8 @@ class Arch(object):
 
         return self.ks_arch is not None
 
-    address_types = (int, long)
-    function_address_types = (int, long)
+    address_types = integer_types
+    function_address_types = integer_types
 
     # various names
     name = None
@@ -532,7 +543,7 @@ def register_arch(regexes, bits, endness, my_arch):
             raise ValueError('Invalid Regular Expression %s' % rx)
     #if not isinstance(my_arch,Arch):
     #    raise TypeError("Arch must be a subclass of archinfo.Arch")
-    if not isinstance(bits, int):
+    if not isinstance(bits, integer_types):
         raise TypeError("Bits must be an int")
     if endness is not None:
         if endness != Endness.BE and endness != Endness.LE and endness != Endness.ME and endness != "any":
